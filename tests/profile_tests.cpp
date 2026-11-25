@@ -4,6 +4,7 @@
 // aim-camera verdict (unity_profile.cpp, unity_aim.hpp) and zoom compensation (zoom.hpp). Built with Gyro4All (target
 // gyro4all_tests); run with tools/test-gyro4all.sh.
 #include "camera_match.hpp"
+#include "nd_view.hpp"
 #include "fov.hpp"
 #include "sensor_pacer.hpp"
 #include "stick_camera.hpp"
@@ -1656,6 +1657,17 @@ void test_unity_legacy_keys() {
     CHECK(legacy_key_button(13) == 0);        // Return
 }
 
+void test_naughtydog_view() {
+    using namespace gyro4all::naughtydog;
+    CHECK(std::abs(strafe_degrees(0) - 59.9) < 1e-9 && std::abs(strafe_degrees(1) + 68.1) < 1e-9);
+    CHECK(std::abs(strafe_degrees(0.45) - (3.6 - 5.5) / 2) < 1e-9);       // between two measured points
+    CHECK(strafe_setting(80) == 0 && strafe_setting(-80) == 1);           // clamped at the table's ends
+    for (double s = 0; s <= 1.0001; s += 0.037) CHECK(std::abs(strafe_setting(strafe_degrees(s)) - std::min(s, 1.0)) < 1e-9);
+    float x = 0, z = 1;  // heading 0
+    turn_heading(x, z, 30);
+    CHECK(std::abs(std::atan2(x, z) * 180 / 3.14159265358979323846 - 30) < 1e-4 && std::abs(x * x + z * z - 1) < 1e-6);
+}
+
 void test_unity_quaternions() {
     using namespace gyro4all::unity;
     auto near_angle = [](double a, double b) { return std::abs(wrap180(a - b)) < 1e-9; };
@@ -2174,6 +2186,7 @@ int main() {
     test_unity_zoom_reference_axis();
     test_unity_discovery();
     test_unity_quaternions();
+    test_naughtydog_view();
     test_unity_legacy_keys();
     test_unity_turn_preserves_roll_and_levels();
     test_rewritten_helper();
