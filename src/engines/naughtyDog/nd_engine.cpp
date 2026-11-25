@@ -11,7 +11,10 @@
 // The controls keep their own view, and the game keeps writes to it (write tests in game):
 //   CameraControlStrafe (on foot): a level unit direction at +0x300 (x, 0, z) and the pitch as a 0..1 setting at +0x4cc
 //   (copy at +0x4c0), 0 = up, 1 = down, mapped to the view's pitch by kStrafePitch (measured, not linear).
+//   The classes derived from CameraControlStrafe (RTTI: Stick, StrafeMelee, Evade, Edge, Balance, OffBalance,
+//   KnockedDown, FreeRope, StrafeSurfaceSwim, StrafeSwimUnderwater) are turned the same way.
 //   CameraControlZoom (aiming, L2): a 3D unit look direction at +0x750 (y = sine of the pitch).
+//   CameraControlCover (in cover): target and current yaw directions and pitch angles (kCoverYawTarget...).
 // A turn to the right lowers the heading atan2(x, z) of both directions (mouse input injected, in game).
 //
 // The controls are made and freed with the camera modes and move in memory while active (pool compaction: the same
@@ -36,6 +39,7 @@
 #include <cmath>
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace gyro4all::naughtydog {
@@ -61,19 +65,49 @@ constexpr uintptr_t kStrafeYaw = 0x300, kStrafePitch = 0x4cc, kStrafePitchCopy =
 constexpr uintptr_t kZoomLook = 0x750;
 constexpr double kZoomMaxPitch = 75;
 
-// Both directions' heading atan2(x, z) falls when the view turns right.
+// CameraControlCover: the view eases toward a target. Yaw: level directions, target +0x4a0 and current +0x490. Pitch:
+// degrees, target +0x484 and current +0x480, + looks down, clamped by the game to 80 (about one view degree each near
+// level). We turn both so that the view follows the gyro at once.
+constexpr uintptr_t kCoverYawTarget = 0x4a0, kCoverYawCurrent = 0x490, kCoverPitchTarget = 0x484, kCoverPitchCurrent = 0x480;
+constexpr double kCoverMaxPitch = 80;
+
+// The directions' heading atan2(x, z) falls when the view turns right (Strafe and Zoom; Cover: a write the same way
+// turned the view the same way).
 constexpr double kYawSense = -1;
 
 // Without an active control update for this long, the player camera isn't in control (ms).
 constexpr ULONGLONG kLiveMs = 100;
 
-enum class Kind : int { None = 0, Strafe = 1, Zoom = 2 };
+enum class Kind : int { None = 0, Strafe = 1, Zoom = 2, Cover = 3 };
+
+// The camera controls the gyro turns: CameraControlStrafe and the classes derived from it (their RTTI: same layout),
+// and CameraControlZoom.
+struct ControlClass {
+    const char* rtti;
+    const char* name;
+    Kind kind;
+};
+constexpr std::array<ControlClass, 13> kClasses = {{
+    {".?AVCameraControlStrafe@@", "CameraControlStrafe", Kind::Strafe},
+    {".?AVCameraControlZoom@@", "CameraControlZoom", Kind::Zoom},
+    {".?AVCameraControlStick@@", "CameraControlStick", Kind::Strafe},
+    {".?AVCameraControlStrafeMelee@@", "CameraControlStrafeMelee", Kind::Strafe},
+    {".?AVCameraControlEvade@@", "CameraControlEvade", Kind::Strafe},
+    {".?AVCameraControlEdge@@", "CameraControlEdge", Kind::Strafe},
+    {".?AVCameraControlBalance@@", "CameraControlBalance", Kind::Strafe},
+    {".?AVCameraControlOffBalance@@", "CameraControlOffBalance", Kind::Strafe},
+    {".?AVCameraControlKnockedDown@@", "CameraControlKnockedDown", Kind::Strafe},
+    {".?AVCameraControlFreeRope@@", "CameraControlFreeRope", Kind::Strafe},
+    {".?AVCameraControlStrafeSurfaceSwim@@", "CameraControlStrafeSurfaceSwim", Kind::Strafe},
+    {".?AVCameraControlStrafeSwimUnderwater@@", "CameraControlStrafeSwimUnderwater", Kind::Strafe},
+    {".?AVCameraControlCover@@", "CameraControlCover", Kind::Cover},
+}};
 
 // --- the game's lookups -----------------------------------------------------------------------------------------
 
 uintptr_t g_manager_table = 0;  // the two-entry manager table
 uintptr_t g_gamepad_flag = 0;   // byte: 1 = the last input came from a gamepad (the camera then smooths the view)
-std::array<uintptr_t, 2> g_vtables{};  // CameraControlStrafe, CameraControlZoom
+std::array<uintptr_t, kClasses.size()> g_vtables{};  // of kClasses (0: not in this exe)
 
 uintptr_t read_ptr(uintptr_t at) {
     uintptr_t v = 0;
@@ -142,24 +176,40 @@ void turn_zoom(uintptr_t control, double pitch, double yaw) {
     mem::guarded_store(control + kZoomLook, out.data(), sizeof(float) * out.size());
 }
 
+void turn_cover(uintptr_t control, double pitch, double yaw) {
+    for (const uintptr_t at : {kCoverYawTarget, kCoverYawCurrent}) {
+        std::array<float, 3> dir{};
+        if (!mem::rd(control + at, dir) || !std::isfinite(dir[0]) || !std::isfinite(dir[2])) return;
+        turn_heading(dir[0], dir[2], kYawSense * yaw);
+        mem::guarded_store(control + at, dir.data(), sizeof(float) * dir.size());
+    }
+    for (const uintptr_t at : {kCoverPitchTarget, kCoverPitchCurrent}) {
+        float angle = 0;
+        if (!mem::rd(control + at, angle) || !std::isfinite(angle)) return;
+        const auto out = static_cast<float>(std::clamp(static_cast<double>(angle) - pitch, -kCoverMaxPitch, kCoverMaxPitch));
+        mem::guarded_store(control + at, &out, sizeof out);
+    }
+}
+
 // --- the update hook and the frame thread -----------------------------------------------------------------------
 
-std::array<UpdateFn, 2> g_update_orig{};
+std::array<UpdateFn, kClasses.size()> g_update_orig{};
 bool g_hooked = false;
 Engine::FrameFn g_frame = nullptr;
 HANDLE g_update_event = nullptr;            // auto-reset: an active control's update
 std::atomic<ULONGLONG> g_active_seen{0};    // tick of the last update of an active Strafe or Zoom control
-std::atomic<int> g_active_kind{0};          // its Kind
+std::atomic<int> g_active_class{-1};        // its index in kClasses
 std::atomic<bool> g_turn_live{false};       // the frame thread's verdict: turn the active control
 SRWLOCK g_turn_lock = SRWLOCK_INIT;
 double g_pending_pitch = 0, g_pending_yaw = 0;  // degrees, from the frame thread, for the next active update
 
-void on_update(void* self, Kind kind) {
+void on_update(void* self, size_t index) {
+    const Kind kind = kClasses[index].kind;
     const auto control = reinterpret_cast<uintptr_t>(self);
     // We only turn the player's active control because the game also updates the controls it blends out.
     const uintptr_t manager = player_manager();
     if (!manager || active_control(manager) != control) return;
-    g_active_kind.store(static_cast<int>(kind), std::memory_order_relaxed);
+    g_active_class.store(static_cast<int>(index), std::memory_order_relaxed);
     g_active_seen.store(GetTickCount64(), std::memory_order_relaxed);
     AcquireSRWLockExclusive(&g_turn_lock);
     const double pitch = g_pending_pitch, yaw = g_pending_yaw;
@@ -174,25 +224,31 @@ void on_update(void* self, Kind kind) {
     }
     if (live && (pitch != 0 || yaw != 0)) {
         if (kind == Kind::Strafe) turn_strafe(control, pitch, yaw);
+        else if (kind == Kind::Cover) turn_cover(control, pitch, yaw);
         else turn_zoom(control, pitch, yaw);
     }
     SetEvent(g_update_event);
 }
 
-template <int K>
+template <size_t K>
 void* __fastcall hooked_update(void* self, void* a, void* b, void* c) {
-    on_update(self, K == 0 ? Kind::Strafe : Kind::Zoom);
+    on_update(self, K);
     return g_update_orig[K](self, a, b, c);
 }
 
-bool hook(int k, void* fn) {
+bool hook(size_t k, void* fn) {
     if (!g_vtables[k]) return false;
     void* original = rtti::patch_slot(g_vtables[k], kUpdateSlot, fn);
     if (!original) return false;
     g_update_orig[k] = reinterpret_cast<UpdateFn>(original);
-    log("naughtydog: %s update hooked (vtable %s slot %d, was %s)", k == 0 ? "CameraControlStrafe" : "CameraControlZoom",
-        mem::module_offset(g_vtables[k]).c_str(), kUpdateSlot, mem::module_offset(reinterpret_cast<uintptr_t>(original)).c_str());
+    log("naughtydog: %s update hooked (vtable %s slot %d, was %s)", kClasses[k].name, mem::module_offset(g_vtables[k]).c_str(),
+        kUpdateSlot, mem::module_offset(reinterpret_cast<uintptr_t>(original)).c_str());
     return true;
+}
+
+template <size_t... K>
+size_t hook_all(std::index_sequence<K...>) {
+    return (size_t{hook(K, reinterpret_cast<void*>(&hooked_update<K>))} + ...);
 }
 
 DWORD WINAPI frame_thread(void*) {
@@ -257,20 +313,17 @@ public:
             g_gamepad_flag ? mem::module_offset(g_gamepad_flag).c_str() : "not found", flag_hits.size(),
             g_gamepad_flag ? ": the camera kept in mouse mode while in control" : ": the gamepad camera may smooth the gyro");
         const rtti::Image im = rtti::exe_image();
-        g_vtables = {rtti::primary_vtable(im, ".?AVCameraControlStrafe@@"), rtti::primary_vtable(im, ".?AVCameraControlZoom@@")};
-        log("naughtydog: camera manager table %s (%zu code match(es)), CameraControlStrafe vtable %s, CameraControlZoom vtable %s",
+        for (size_t k = 0; k < kClasses.size(); ++k) g_vtables[k] = rtti::primary_vtable(im, kClasses[k].rtti);
+        log("naughtydog: camera manager table %s (%zu code match(es)), %zu of %zu camera control classes found",
             g_manager_table ? mem::module_offset(g_manager_table).c_str() : "not found", hits.size(),
-            g_vtables[0] ? mem::module_offset(g_vtables[0]).c_str() : "not found",
-            g_vtables[1] ? mem::module_offset(g_vtables[1]).c_str() : "not found");
+            static_cast<size_t>(std::ranges::count_if(g_vtables, [](uintptr_t vt) { return vt != 0; })), kClasses.size());
         // We make the update event here because configure runs before frame_source, and the hooks need it.
         g_update_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         if (!g_manager_table || !g_update_event) {
             log("naughtydog: %s: gyro as right stick", g_manager_table ? "no update event" : "no camera manager table");
             return;
         }
-        const bool strafe = hook(0, reinterpret_cast<void*>(&hooked_update<0>));
-        const bool zoom = hook(1, reinterpret_cast<void*>(&hooked_update<1>));
-        g_hooked = strafe || zoom;
+        g_hooked = hook_all(std::make_index_sequence<kClasses.size()>{}) > 0;
         if (!g_hooked) log("naughtydog: no camera control update hooked: gyro as right stick");
     }
 
@@ -286,14 +339,15 @@ public:
             return f;
         }
         const bool live = GetTickCount64() - g_active_seen.load(std::memory_order_relaxed) <= kLiveMs;
-        const auto kind = static_cast<Kind>(g_active_kind.load(std::memory_order_relaxed));
-        const Kind shown = live ? kind : Kind::None;
-        if (shown != shown_) {
-            log("naughtydog: %s", shown == Kind::Strafe ? "on-foot camera in control"
-                                  : shown == Kind::Zoom ? "aiming camera in control"
-                                                        : "player camera not in control (menu, cutscene or another camera)");
-            shown_ = shown;
+        const int index = live ? g_active_class.load(std::memory_order_relaxed) : -1;
+        const Kind shown = index >= 0 ? kClasses[static_cast<size_t>(index)].kind : Kind::None;
+        if (index != shown_class_) {
+            if (index >= 0) log("naughtydog: %s in control (%s view)", kClasses[static_cast<size_t>(index)].name,
+                                shown == Kind::Zoom ? "aim" : "on-foot");
+            else log("naughtydog: player camera not in control (menu, cutscene or another camera)");
+            shown_class_ = index;
         }
+        shown_ = shown;
         g_turn_live.store(shown != Kind::None, std::memory_order_relaxed);
         if (shown == Kind::None) {
             AcquireSRWLockExclusive(&g_turn_lock);
@@ -301,7 +355,7 @@ public:
             ReleaseSRWLockExclusive(&g_turn_lock);
         }
         f.view_id = shown == Kind::Strafe ? 1 : shown == Kind::Zoom ? 2 : 0;
-        f.target = shown == Kind::Strafe ? "CameraControlStrafe" : shown == Kind::Zoom ? "CameraControlZoom" : "another camera";
+        f.target = index >= 0 ? kClasses[static_cast<size_t>(index)].name : "another camera";
         return f;
     }
 
@@ -325,6 +379,7 @@ public:
 
 private:
     Kind shown_ = Kind::None;
+    int shown_class_ = -1;  // index in kClasses of the control in control (-1: none)
 };
 
 }  // namespace
